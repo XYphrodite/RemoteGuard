@@ -105,11 +105,27 @@
         $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
         if ($isAdmin) {
             try {
-                $tr = "`"$exe`" -Tray"
-                & schtasks.exe /Create /TN 'RemoteGuardTray' /TR $tr /SC ONLOGON /RL HIGHEST /F | Out-Null
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Output "Autostart task 'RemoteGuardTray' configured (tray, elevated)."
-                }
+                $svc = New-Object -ComObject Schedule.Service
+                $svc.Connect()
+                $rootFolder = $svc.GetFolder('\')
+                $td = $svc.NewTask(0)
+                $td.RegistrationInfo.Description = 'Start Remote Guard in system tray with elevated privileges at logon.'
+                $td.Principal.UserId = "$env:USERDOMAIN\$env:USERNAME"
+                $td.Principal.LogonType = 3 # TASK_LOGON_INTERACTIVE_TOKEN
+                $td.Principal.RunLevel = 1  # TASK_RUNLEVEL_HIGHEST
+                $td.Settings.Enabled = $true
+                $td.Settings.DisallowStartIfOnBatteries = $false
+                $td.Settings.StopIfGoingOnBatteries = $false
+                $td.Settings.ExecutionTimeLimit = 'PT0S'
+                $td.Settings.MultipleInstances = 2 # TASK_INSTANCES_IGNORE_NEW
+                $trigger = $td.Triggers.Create(9) # TASK_TRIGGER_LOGON
+                $trigger.UserId = "$env:USERDOMAIN\$env:USERNAME"
+                $action = $td.Actions.Create(0) # TASK_ACTION_EXEC
+                $action.Path = $exe
+                $action.Arguments = '-Tray'
+                $action.WorkingDirectory = $InstallDir
+                $rootFolder.RegisterTaskDefinition('RemoteGuardTray', $td, 6, $null, $null, 3) | Out-Null
+                Write-Output "Autostart task 'RemoteGuardTray' configured (tray, elevated)."
             } catch {
                 Write-Warning "Failed to configure autostart task: $($_.Exception.Message)"
             }
