@@ -1,15 +1,9 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
-    Установщик и обновлятор Remote Guard.
-    Запуск (PowerShell 5.1+):
+    Remote Guard installer and updater.
+    Run in PowerShell 5.1+ or PowerShell 7+:
 
         powershell -c "irm https://raw.githubusercontent.com/XYphrodite/RemoteGuard/main/install.ps1 | iex"
-
-    Скачивает релиз RemoteGuard.zip с GitHub Releases, проверяет SHA-256 и
-    работоспособность бинарника (--help), останавливает запущенный экземпляр,
-    устанавливает в %LOCALAPPDATA%\Programs\RemoteGuard, создаёт ярлык на рабочем столе
-    (и задачу автозапуска в трее при наличии прав администратора) и запускает приложение.
-    Требуется .NET 10 Desktop Runtime.
 #>
 & {
     [CmdletBinding()]
@@ -28,7 +22,7 @@
     $desktopRuntime = & dotnet --list-runtimes 2>$null |
         Where-Object { $_ -like 'Microsoft.WindowsDesktop.App 10.*' }
     if (-not $desktopRuntime) {
-        throw '.NET 10 Desktop Runtime не найден. Установи его: https://dotnet.microsoft.com/download/dotnet/10.0'
+        throw '.NET 10 Desktop Runtime not found. Install it from https://dotnet.microsoft.com/download/dotnet/10.0'
     }
 
     if ($Version -eq 'latest') {
@@ -46,41 +40,55 @@
         $zip = Join-Path $tmp $asset
         $sha = Join-Path $tmp "$asset.sha256"
 
-        Write-Output "Скачиваю $zipUrl ..."
+        Write-Output "Downloading $zipUrl ..."
         Invoke-WebRequest -Uri $zipUrl -OutFile $zip -UseBasicParsing -Headers $headers
         Invoke-WebRequest -Uri $shaUrl -OutFile $sha -UseBasicParsing -Headers $headers
 
         $shaText = [IO.File]::ReadAllText($sha)
         if ($shaText -notmatch '([0-9a-fA-F]{64})') {
-            throw 'Не удалось прочитать контрольную сумму SHA-256 релиза.'
+            throw 'Failed to parse SHA-256 checksum from release sidecar.'
         }
         $expectedHash = $Matches[1].ToLowerInvariant()
-        $actualHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($actualHash -ne $expectedHash) {
-            throw "Не совпал SHA-256 архива: ожидался $expectedHash, получен $actualHash."
+
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $fs = [IO.File]::OpenRead($zip)
+            try {
+                $hashBytes = $sha256.ComputeHash($fs)
+            } finally {
+                $fs.Dispose()
+            }
+        } finally {
+            $sha256.Dispose()
         }
-        Write-Output 'SHA-256 проверен.'
+        $actualHash = ([BitConverter]::ToString($hashBytes) -replace '-', '').ToLowerInvariant()
+        if ($actualHash -ne $expectedHash) {
+            throw "SHA-256 mismatch: expected $expectedHash, got $actualHash."
+        }
+        Write-Output 'SHA-256 verified.'
 
         $stage = Join-Path $tmp 'app'
-        Expand-Archive -LiteralPath $zip -DestinationPath $stage
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $stage)
+
         $stagedExe = Join-Path $stage 'RemoteGuard.exe'
         if (-not (Test-Path -LiteralPath $stagedExe)) {
-            throw 'В архиве релиза не найден RemoteGuard.exe.'
+            throw 'RemoteGuard.exe was not found in the release archive.'
         }
 
         $probe = Start-Process -FilePath $stagedExe -ArgumentList '--help' -Wait -PassThru -WindowStyle Hidden
         if ($probe.ExitCode -ne 0) {
-            throw "Проверка нового RemoteGuard.exe не прошла (код $($probe.ExitCode))."
+            throw "Health probe (--help) failed with exit code $($probe.ExitCode)."
         }
 
         $running = @(Get-Process -Name 'RemoteGuard' -ErrorAction SilentlyContinue)
         if ($running.Count -gt 0) {
-            Write-Output 'Останавливаю запущенный Remote Guard перед обновлением...'
+            Write-Output 'Stopping running Remote Guard instance...'
             $running | Stop-Process -Force
             Start-Sleep -Milliseconds 500
         }
 
-        Write-Output "Устанавливаю в $InstallDir ..."
+        Write-Output "Installing to $InstallDir ..."
         New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
         Get-ChildItem -LiteralPath $InstallDir -Filter 'RemoteGuard.exe.old-*' -ErrorAction SilentlyContinue |
             Remove-Item -Force -ErrorAction SilentlyContinue
@@ -92,30 +100,28 @@
         $desktopLink.TargetPath = $exe
         $desktopLink.WorkingDirectory = $InstallDir
         $desktopLink.Save()
-        Write-Output 'Ярлык на рабочем столе обновлён.'
+        Write-Output 'Desktop shortcut updated.'
 
         $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
         if ($isAdmin) {
             try {
-                $taskName = 'RemoteGuardTray'
-                $action = New-ScheduledTaskAction -Execute $exe -Argument '-Tray' -WorkingDirectory $InstallDir
-                $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-                $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
-                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
-                Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-                Write-Output "Автозапуск в трее настроен (задача '$taskName')."
+                $tr = "`"$exe`" -Tray"
+                & schtasks.exe /Create /TN 'RemoteGuardTray' /TR $tr /SC ONLOGON /RL HIGHEST /F | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Output "Autostart task 'RemoteGuardTray' configured (tray, elevated)."
+                }
             } catch {
-                Write-Warning "Не удалось настроить задачу автозапуска: $($_.Exception.Message)"
+                Write-Warning "Failed to configure autostart task: $($_.Exception.Message)"
             }
         }
 
         if ([Environment]::UserInteractive) {
             Start-Process -FilePath $exe
-            Write-Output 'Remote Guard запущен.'
+            Write-Output 'Remote Guard started.'
         } else {
-            Write-Output 'Сессия неинтерактивна — приложение не запущено. Запусти ярлык Remote Guard на рабочем столе.'
+            Write-Output 'Non-interactive session: launch Remote Guard from the Desktop shortcut.'
         }
-        Write-Output 'Установка завершена.'
+        Write-Output 'Installation complete.'
     } finally {
         if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force }
     }
