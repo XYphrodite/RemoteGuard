@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
+    <ProjectReference Include="..\..\..\self-update-kit\src\SelfUpdateKit\SelfUpdateKit.csproj" />
     <Resource Include="Assets\RemoteGuard.ico" />
   </ItemGroup>
 
@@ -19,7 +20,7 @@
     <AssemblyName>RemoteGuard</AssemblyName>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\RemoteGuard.ico</ApplicationIcon>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Description>Remote Guard — контроль удалённого доступа на этом ПК</Description>
   </PropertyGroup>
 

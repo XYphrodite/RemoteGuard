@@ -7,13 +7,14 @@ using RemoteGuard.App.Services;
 namespace RemoteGuard.App;
 
 /// <summary>
-/// System tray icon with color-coded shield badge and quick toggle actions.
+/// System tray icon with color-coded shield badge, quick toggle actions, and update trigger.
 /// </summary>
 public sealed class TrayIcon : IDisposable
 {
     private readonly NotifyIcon _icon;
     private readonly ToolStripMenuItem _disableAllItem;
     private readonly ToolStripMenuItem _enableAllItem;
+    private readonly ToolStripMenuItem _updateItem;
     private readonly Icon _openIcon;
     private readonly Icon _partialIcon;
     private readonly Icon _blockedIcon;
@@ -22,6 +23,7 @@ public sealed class TrayIcon : IDisposable
     public event Action? OpenRequested;
     public event Action? DisableAllRequested;
     public event Action? EnableAllRequested;
+    public event Action? UpdateRequested;
     public event Action? ExitRequested;
 
     public TrayIcon()
@@ -31,9 +33,10 @@ public sealed class TrayIcon : IDisposable
         _blockedIcon = CreateShieldIcon(Color.FromArgb(255, 255, 122, 112)); // Coral-red: all blocked
 
         var menu = new ContextMenuStrip();
-        var open = new ToolStripMenuItem("Открыть Remote Guard");
+        var open = new ToolStripMenuItem($"Открыть Remote Guard ({RemoteGuardUpdate.DisplayVersion})");
         _disableAllItem = new ToolStripMenuItem("Заблокировать весь доступ");
         _enableAllItem = new ToolStripMenuItem("Включить весь доступ");
+        _updateItem = new ToolStripMenuItem("Проверить обновления");
         var exit = new ToolStripMenuItem("Закрыть приложение");
 
         menu.Items.Add(open);
@@ -41,17 +44,19 @@ public sealed class TrayIcon : IDisposable
         menu.Items.Add(_disableAllItem);
         menu.Items.Add(_enableAllItem);
         menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(_updateItem);
         menu.Items.Add(exit);
 
         open.Click += (_, _) => OpenRequested?.Invoke();
         _disableAllItem.Click += (_, _) => DisableAllRequested?.Invoke();
         _enableAllItem.Click += (_, _) => EnableAllRequested?.Invoke();
+        _updateItem.Click += (_, _) => UpdateRequested?.Invoke();
         exit.Click += (_, _) => ExitRequested?.Invoke();
 
         _icon = new NotifyIcon
         {
             Icon = _openIcon,
-            Text = "Remote Guard — проверка служб…",
+            Text = $"Remote Guard {RemoteGuardUpdate.DisplayVersion} — проверка служб…",
             ContextMenuStrip = menu,
             Visible = true,
         };
@@ -84,6 +89,12 @@ public sealed class TrayIcon : IDisposable
         _icon.Text = tooltip.Length <= 63 ? tooltip : tooltip[..63];
         _disableAllItem.Enabled = !busy && activeCount > 0;
         _enableAllItem.Enabled = !busy && installedCount > 0 && activeCount < installedCount;
+    }
+
+    public void SetUpdateState(string label, bool enabled)
+    {
+        _updateItem.Text = label;
+        _updateItem.Enabled = enabled;
     }
 
     private static Icon CreateShieldIcon(Color shieldColor)

@@ -7,6 +7,8 @@ using System.Windows.Media;
 using System.Windows.Shapes;
 using System.Windows.Threading;
 using RemoteGuard.App.Services;
+using SelfUpdateKit;
+using Application = System.Windows.Application;
 using Brush = System.Windows.Media.Brush;
 using CheckBox = System.Windows.Controls.CheckBox;
 using Clipboard = System.Windows.Clipboard;
@@ -18,6 +20,8 @@ public partial class MainWindow : Window
 {
     private static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(0x61, 0xE8, 0xBA));
     private static readonly Brush AccentDark = new SolidColorBrush(Color.FromRgb(0x10, 0x25, 0x1E));
+    private static readonly Brush SmallSurface = new SolidColorBrush(Color.FromRgb(0x2B, 0x38, 0x4E));
+    private static readonly Brush LightText = new SolidColorBrush(Color.FromRgb(0xF1, 0xF5, 0xFA));
     private static readonly Brush Idle = new SolidColorBrush(Color.FromRgb(0xAB, 0xC4, 0xF7));
     private static readonly Brush Warning = new SolidColorBrush(Color.FromRgb(0xFF, 0xD1, 0x66));
     private static readonly Brush Blocked = new SolidColorBrush(Color.FromRgb(0xFF, 0x8A, 0x80));
@@ -31,11 +35,14 @@ public partial class MainWindow : Window
     private readonly RemoteAccessCoordinator _coordinator;
     private readonly DispatcherTimer _pollTimer = new() { Interval = TimeSpan.FromSeconds(5) };
     private readonly DispatcherTimer _signalTimer = new() { Interval = TimeSpan.FromMilliseconds(350) };
+    private readonly DispatcherTimer _updateTimer = new() { Interval = TimeSpan.FromHours(6) };
     private readonly Queue<string> _logLines = new();
 
     private IReadOnlyList<ServiceStatusSnapshot> _snapshots = [];
+    private SelfUpdateReport? _availableUpdate;
     private bool _busy;
     private bool _pollBusy;
+    private bool _updateBusy;
     private bool _updatingUi;
     private bool _exitRequested;
 
@@ -48,8 +55,7 @@ public partial class MainWindow : Window
         WindowFrame.Hook(this);
         UpdateMaximizeGlyph();
 
-        var ver = typeof(MainWindow).Assembly.GetName().Version;
-        var displayVersion = ver is null ? "v0.1.0" : $"v{ver.Major}.{ver.Minor}.{Math.Max(0, ver.Build)}";
+        var displayVersion = RemoteGuardUpdate.DisplayVersion;
         Title = $"Remote Guard {displayVersion}";
         TopBarTitleLabel.Text = Title;
         VersionLabel.Text = displayVersion;
@@ -65,6 +71,7 @@ public partial class MainWindow : Window
         _tray.OpenRequested += ShowWindow;
         _tray.DisableAllRequested += () => _ = ToggleAllAsync(explicitEnable: false);
         _tray.EnableAllRequested += () => _ = ToggleAllAsync(explicitEnable: true);
+        _tray.UpdateRequested += () => _ = HandleUpdateActionAsync(userInitiated: true);
         _tray.ExitRequested += ExitApplication;
 
         _pollTimer.Tick += (_, _) => _ = RefreshStatusAsync(userInitiated: false);
@@ -73,9 +80,11 @@ public partial class MainWindow : Window
             if (_showEventAccessor?.Invoke() is { } ev && ev.WaitOne(0))
                 ShowWindow();
         };
+        _updateTimer.Tick += (_, _) => _ = CheckForUpdateAsync(userInitiated: false);
 
         _pollTimer.Start();
         _signalTimer.Start();
+        _updateTimer.Start();
 
         AppendLog(new LogEntry(DateTimeOffset.Now, isAdmin ? LogLevel.Info : LogLevel.Warning,
             isAdmin
@@ -83,6 +92,7 @@ public partial class MainWindow : Window
                 : "Запущено без прав администратора — переключение служб может не сработать."));
 
         _ = RefreshStatusAsync(userInitiated: false);
+        _ = CheckForUpdateStartupAsync();
 
         if (startHidden)
             Hide();
@@ -352,6 +362,172 @@ public partial class MainWindow : Window
         LogTextBox.Clear();
     }
 
+    // ---- self-update (SelfUpdateKit) -------------------------------------
+
+    private void OnUpdateClick(object sender, RoutedEventArgs e) =>
+        _ = HandleUpdateActionAsync(userInitiated: true);
+
+    private async Task CheckForUpdateStartupAsync()
+    {
+        await Task.Delay(TimeSpan.FromSeconds(5));
+        await CheckForUpdateAsync(userInitiated: false);
+    }
+
+    private Task HandleUpdateActionAsync(bool userInitiated) =>
+        _availableUpdate is { Status: SelfUpdateStatus.UpdateAvailable }
+            ? ApplyUpdateAsync()
+            : CheckForUpdateAsync(userInitiated);
+
+    private async Task CheckForUpdateAsync(bool userInitiated)
+    {
+        if (_updateBusy)
+            return;
+
+        if (!RemoteGuardUpdate.CanSelfUpdate(Environment.ProcessPath))
+        {
+            if (userInitiated)
+            {
+                UpdateStatusLabel.Foreground = Muted;
+                UpdateStatusLabel.Text = "Доступно только в установленном RemoteGuard.exe";
+            }
+            return;
+        }
+
+        _updateBusy = true;
+        UpdateButton.IsEnabled = false;
+        _tray.SetUpdateState("Проверяем обновления…", enabled: false);
+        if (userInitiated)
+        {
+            UpdateStatusLabel.Foreground = Muted;
+            UpdateStatusLabel.Text = "Проверяем GitHub Releases…";
+        }
+
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            var report = await RemoteGuardUpdate.CheckAsync(cts.Token);
+            if (report.Status == SelfUpdateStatus.UpdateAvailable)
+            {
+                _availableUpdate = report;
+                var label = $"Обновить до v{report.Release}";
+                UpdateButton.Content = label;
+                UpdateButton.Background = Accent;
+                UpdateButton.Foreground = AccentDark;
+                UpdateStatusLabel.Foreground = Accent;
+                UpdateStatusLabel.Text = $"Доступна новая версия {report.Tag}";
+                _tray.SetUpdateState(label, enabled: true);
+                AppendLog(new LogEntry(DateTimeOffset.Now, LogLevel.Info, $"Доступно обновление: {report.Tag}"));
+            }
+            else
+            {
+                _availableUpdate = null;
+                ResetUpdateButtonAppearance();
+                _tray.SetUpdateState("Проверить обновления", enabled: true);
+                if (userInitiated)
+                {
+                    UpdateStatusLabel.Foreground = Muted;
+                    UpdateStatusLabel.Text = $"Актуальная версия ({RemoteGuardUpdate.DisplayVersion})";
+                    AppendLog(new LogEntry(DateTimeOffset.Now, LogLevel.Info, $"Обновлений нет ({RemoteGuardUpdate.DisplayVersion})."));
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _tray.SetUpdateState(
+                _availableUpdate is { Status: SelfUpdateStatus.UpdateAvailable } avail
+                    ? $"Обновить до v{avail.Release}"
+                    : "Проверить обновления",
+                enabled: true);
+            if (userInitiated)
+            {
+                UpdateStatusLabel.Foreground = Blocked;
+                UpdateStatusLabel.Text = "Не удалось проверить: " + ex.Message;
+                AppendLog(new LogEntry(DateTimeOffset.Now, LogLevel.Warning, $"Ошибка проверки обновлений: {ex.Message}"));
+            }
+        }
+        finally
+        {
+            _updateBusy = false;
+            UpdateButton.IsEnabled = true;
+        }
+    }
+
+    private async Task ApplyUpdateAsync()
+    {
+        if (_updateBusy) return;
+        _updateBusy = true;
+        UpdateButton.IsEnabled = false;
+        _tray.SetUpdateState("Обновляем…", enabled: false);
+        UpdateStatusLabel.Foreground = Muted;
+        UpdateStatusLabel.Text = "Скачивание обновления…";
+        AppendLog(new LogEntry(DateTimeOffset.Now, LogLevel.Info, "Скачиваем обновление через SelfUpdateKit…"));
+
+        try
+        {
+            var target = _availableUpdate;
+            var report = await RemoteGuardUpdate.ApplyWithElevationFallbackAsync(
+                target?.Release,
+                target?.Tag,
+                progress => Dispatcher.BeginInvoke(() => ShowUpdateProgress(progress)),
+                CancellationToken.None);
+
+            if (report.Status == SelfUpdateStatus.Updated)
+            {
+                UpdateStatusLabel.Foreground = Accent;
+                UpdateStatusLabel.Text = $"Установлена {report.Tag}. Перезапуск…";
+                AppendLog(new LogEntry(DateTimeOffset.Now, LogLevel.Success, $"Обновлено до {report.Tag}. Перезапуск…"));
+                var startInTray = !IsVisible;
+                _exitRequested = true;
+                Close();
+                if (Application.Current is App app)
+                    app.RestartIntoUpdatedBinary(startInTray);
+                return;
+            }
+
+            _availableUpdate = null;
+            ResetUpdateButtonAppearance();
+            _tray.SetUpdateState("Проверить обновления", enabled: true);
+            UpdateStatusLabel.Foreground = Muted;
+            UpdateStatusLabel.Text = $"Актуальная версия ({RemoteGuardUpdate.DisplayVersion})";
+        }
+        catch (Exception ex)
+        {
+            UpdateStatusLabel.Foreground = Blocked;
+            UpdateStatusLabel.Text = "Ошибка обновления: " + ex.Message;
+            AppendLog(new LogEntry(DateTimeOffset.Now, LogLevel.Error, $"Ошибка обновления: {ex.Message}"));
+            _tray.SetUpdateState(
+                _availableUpdate is { } avail ? $"Обновить до v{avail.Release}" : "Проверить обновления",
+                enabled: true);
+        }
+        finally
+        {
+            _updateBusy = false;
+            UpdateButton.IsEnabled = true;
+        }
+    }
+
+    private void ShowUpdateProgress(SelfUpdateProgress progress)
+    {
+        UpdateStatusLabel.Foreground = Muted;
+        UpdateStatusLabel.Text = progress.Phase switch
+        {
+            SelfUpdatePhase.Checking => "Проверка релиза…",
+            SelfUpdatePhase.Downloading when progress.TotalBytes is > 0 && progress.ReceivedBytes is { } r =>
+                $"Скачивание {Math.Min(100, (int)(100.0 * r / progress.TotalBytes.Value))}%…",
+            SelfUpdatePhase.Downloading => "Скачивание…",
+            SelfUpdatePhase.Verifying => "Проверка SHA-256…",
+            SelfUpdatePhase.Installing => "Установка и проверка запуска…",
+            _ => UpdateStatusLabel.Text,
+        };
+    }
+
+    private void ResetUpdateButtonAppearance()
+    {
+        UpdateButton.Content = "Проверить обновления";
+        UpdateButton.Background = SmallSurface;
+        UpdateButton.Foreground = LightText;
+    }
+
     // ---- Window / Tray lifecycle -----------------------------------------
 
     private void ShowWindow()
@@ -383,6 +559,7 @@ public partial class MainWindow : Window
     {
         _pollTimer.Stop();
         _signalTimer.Stop();
+        _updateTimer.Stop();
         _coordinator.LogAdded -= OnCoordinatorLogAdded;
         _tray.Dispose();
         base.OnClosed(e);

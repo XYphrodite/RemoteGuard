@@ -19,9 +19,19 @@ jobs:
     defaults:
       run:
         shell: pwsh
+        working-directory: RemoteGuard
     steps:
       - name: Checkout RemoteGuard
         uses: actions/checkout@v4
+        with:
+          path: RemoteGuard
+
+      - name: Checkout shared SelfUpdateKit
+        uses: actions/checkout@v4
+        with:
+          repository: XYphrodite/self-update-kit
+          ref: v0.3.0
+          path: self-update-kit
 
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
